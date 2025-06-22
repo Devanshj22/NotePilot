@@ -203,28 +203,46 @@ const App = () => {
     setIsGenerating(true);
     setShowSummary(false);
     
-    // Simulate API call with realistic delay
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('format', '1'); // You can allow user to choose 1 or 2 formats
     
-    // Generate a sample summary based on file name
-    const sampleSummary = `This document "${file.name}" has been successfully processed by NotePilot AI.
-
-Key Points:
-• The document contains important information relevant to your research or study needs
-• Main concepts have been identified and distilled into digestible insights
-• Critical data points and conclusions are highlighted for quick reference
-• The content has been organized in a logical, easy-to-understand format
-
-Summary:
-The uploaded PDF presents comprehensive information that covers multiple aspects of the subject matter. The document structure follows a logical progression, beginning with foundational concepts and building toward more complex ideas. Key findings suggest that the material is well-researched and provides valuable insights for academic or professional purposes.
-
-The content demonstrates clear evidence-based reasoning and includes relevant examples that support the main arguments. Overall, this document serves as a valuable resource for understanding the topic in depth while providing practical applications for the presented concepts.
-
-This summary was generated in ${((Date.now() % 10000) / 1000).toFixed(1)} seconds using advanced AI analysis.`;
-
-    setSummary(sampleSummary);
+    try {
+      // 1️⃣ Upload file
+      const uploadResponse = await fetch('http://localhost:8000/upload', {
+        method: 'POST',
+        body: formData
+      });
+      
+      const uploadData = await uploadResponse.json();
+      const sessionId = uploadData.session_id;
+      
+      // 2️⃣ Poll for status
+      let processingDone = false;
+      while (!processingDone) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        const statusResponse = await fetch(`http://localhost:8000/status/${sessionId}`);
+        const statusData = await statusResponse.json();
+        
+        if (statusData.status === 'completed') {
+          // 3️⃣ Get generated summary text
+          const textFile = await fetch(`http://localhost:8000/download/${sessionId}/txt`);
+          const summaryText = await textFile.text();
+          setSummary(summaryText);
+          processingDone = true;
+          setShowSummary(true);
+        } else if (statusData.status === 'error') {
+          alert("Processing failed: " + statusData.message);
+          processingDone = true;
+        }
+      }
+    } catch (error) {
+      console.error('Error:', error);
+      alert('Something went wrong.');
+    }
+    
     setIsGenerating(false);
-    setShowSummary(true);
   };
 
   const handleAuthToggle = (message) => {
@@ -271,8 +289,8 @@ This summary was generated in ${((Date.now() % 10000) / 1000).toFixed(1)} second
       {/* Footer */}
       <footer className="footer">
         <div className="container">
-          <p>Made with ❤️ by Devansh,Harveer,Shrey,Satnam</p>
-          <a href="https://github.com/Devanshj22/NotePilot" className="github-link">
+          <p>Made with ❤️ by Devansh Jain</p>
+          <a href="https://github.com" className="github-link">
             View on GitHub
           </a>
         </div>
@@ -1184,6 +1202,17 @@ body {
   .summary-content {
     font-size: 1rem;
     line-height: 1.6;
+  }
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(30px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 `;
