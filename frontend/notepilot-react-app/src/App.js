@@ -271,8 +271,8 @@ This summary was generated in ${((Date.now() % 10000) / 1000).toFixed(1)} second
       {/* Footer */}
       <footer className="footer">
         <div className="container">
-          <p>Made with ❤️ by Devansh Jain</p>
-          <a href="https://github.com" className="github-link">
+          <p>Made with ❤️ by Devansh,Harveer,Shrey,Satnam</p>
+          <a href="https://github.com/Devanshj22/NotePilot" className="github-link">
             View on GitHub
           </a>
         </div>

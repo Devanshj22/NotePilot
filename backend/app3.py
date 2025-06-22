@@ -1,42 +1,44 @@
+from flask import Flask, request, render_template, send_file, jsonify, session
 import os
+import tempfile
+import shutil
+from werkzeug.utils import secure_filename
+import uuid
 import subprocess
 import platform
 from pdf2image import convert_from_path
 import pytesseract
 from PIL import Image
 import google.generativeai as genai
+from fpdf import FPDF
+import textwrap
+import threading
+import time
+
+app = Flask(__name__)
+app.secret_key = 'your-secret-key-change-this'  # Change this to a random secret key
 
 # -------------- CONFIGURATION --------------
-# Replace YOUR_ACTUAL_API_KEY_HERE with your real API key
-API_KEY = "AIzaSyADT2XPzUcY40XAzmCRSukwLknKcdv6JX4"
+# Replace with your actual API key or use environment variable
+API_KEY = os.getenv('GEMINI_API_KEY', "AIzaSyADT2XPzUcY40XAzmCRSukwLknKcdv6JX4")
 genai.configure(api_key=API_KEY)
 
-INPUT_FOLDER = "input_pdfs"
-TEMP_IMAGES_FOLDER = "temp_images"
-DOWNLOADS_FOLDER = os.path.join(os.path.expanduser("~"), "Downloads")
+# Flask-specific folders
+UPLOAD_FOLDER = 'flask_uploads'
+TEMP_IMAGES_FOLDER = 'flask_temp_images'
+OUTPUT_FOLDER = 'flask_output'
 MAX_CHUNK_SIZE = 15000
+ALLOWED_EXTENSIONS = {'pdf'}
 
-# -------------- USER OPTIONS --------------
+# Create necessary directories
+for folder in [UPLOAD_FOLDER, TEMP_IMAGES_FOLDER, OUTPUT_FOLDER]:
+    os.makedirs(folder, exist_ok=True)
 
-def get_user_format_choice():
-    """Let user choose what type of study material they want"""
-    print("\n" + "="*50)
-    print("📚 What type of study material do you want?")
-    print("="*50)
-    
-    formats = {
-        "1": "🎯 Smart Cheat Sheet (organized reference guide)",
-        "2": "📋 Summary Notes (detailed explanations)"
-    }
-    
-    for key, description in formats.items():
-        print(f"{key}. {description}")
-    
-    while True:
-        choice = input("\nEnter your choice (1-2): ").strip()
-        if choice in formats:
-            return choice
-        print("Please enter a number from 1-2.")
+# Store processing status for each session
+processing_status = {}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def create_custom_prompt(format_choice, chunk):
     """Create AI prompt based on user choices"""
@@ -79,80 +81,47 @@ Transform this content:
     
     return base_prompt
 
-# -------------- PDF PROCESSING --------------
-
-def find_pdf():
-    """Find and select a PDF file from the input folder"""
-    if not os.path.exists(INPUT_FOLDER):
-        os.makedirs(INPUT_FOLDER)
-        print(f"Created folder '{INPUT_FOLDER}'. Please put a PDF file inside.")
-        return None
-
-    files = [f for f in os.listdir(INPUT_FOLDER) if f.lower().endswith('.pdf')]
-    if not files:
-        print("No PDFs found in input_pdfs. Add a PDF and try again.")
-        return None
-
-    if len(files) == 1:
-        selected_file = files[0]
-        print(f"Found PDF: {selected_file}")
-    else:
-        print("Found PDF files:")
-        for idx, f in enumerate(files, 1):
-            print(f"{idx}. {f}")
-        
-        while True:
-            try:
-                choice = int(input(f"Select a PDF (1-{len(files)}): ")) - 1
-                if 0 <= choice < len(files):
-                    selected_file = files[choice]
-                    break
-                else:
-                    print(f"Please enter a number between 1 and {len(files)}")
-            except ValueError:
-                print("Please enter a valid number")
-    
-    return os.path.join(INPUT_FOLDER, selected_file)
-
-def convert_pdf_to_images(pdf_path):
+def convert_pdf_to_images(pdf_path, session_id):
     """Convert PDF pages to images for OCR processing"""
     try:
-        os.makedirs(TEMP_IMAGES_FOLDER, exist_ok=True)
-        print("Converting PDF to images...")
+        session_temp_folder = os.path.join(TEMP_IMAGES_FOLDER, session_id)
+        os.makedirs(session_temp_folder, exist_ok=True)
+        
+        print(f"Converting PDF to images for session {session_id}...")
         pages = convert_from_path(pdf_path, dpi=300)
         
+        image_paths = []
         for idx, page in enumerate(pages, 1):
-            img_path = os.path.join(TEMP_IMAGES_FOLDER, f"page_{idx:03d}.jpg")
+            img_path = os.path.join(session_temp_folder, f"page_{idx:03d}.jpg")
             page.save(img_path, "JPEG", quality=95)
+            image_paths.append(img_path)
             print(f"Saved: page_{idx:03d}.jpg")
 
-        return len(pages)
+        return image_paths
     
     except Exception as e:
         print(f"Error converting PDF to images: {e}")
-        return 0
+        return []
 
-def extract_text_from_images():
+def extract_text_from_images(image_paths):
     """Extract text from images using OCR"""
     try:
-        images = sorted([f for f in os.listdir(TEMP_IMAGES_FOLDER) if f.lower().endswith('.jpg')])
-        if not images:
+        if not image_paths:
             print("No images found for text extraction!")
             return ""
         
         full_text = ""
         print("Extracting text from images...")
 
-        for img in images:
-            img_path = os.path.join(TEMP_IMAGES_FOLDER, img)
-            print(f"Processing: {img}")
+        for img_path in image_paths:
+            print(f"Processing: {os.path.basename(img_path)}")
             
             try:
                 image = Image.open(img_path)
                 text = pytesseract.image_to_string(image, config='--oem 3 --psm 6')
-                full_text += f"\n--- Page {img} ---\n{text}\n"
+                full_text += f"\n--- Page {os.path.basename(img_path)} ---\n{text}\n"
             except Exception as e:
-                print(f"Error processing {img}: {e}")
+                print(f"Error processing {img_path}: {e}")
                 continue
 
         return full_text.strip()
@@ -160,8 +129,6 @@ def extract_text_from_images():
     except Exception as e:
         print(f"Error during text extraction: {e}")
         return ""
-
-# -------------- AI GENERATION --------------
 
 def generate_study_material(text, format_choice):
     """Generate study material based on user choices"""
@@ -199,30 +166,22 @@ def generate_study_material(text, format_choice):
         print(f"Error in AI generation: {e}")
         return ""
 
-# -------------- SAVING OUTPUT --------------
-
-def save_text(content, filename="StudyMaterial.txt"):
+def save_text(content, filepath):
     """Save content as text file"""
     try:
-        os.makedirs(DOWNLOADS_FOLDER, exist_ok=True)
-        path = os.path.join(DOWNLOADS_FOLDER, filename)
-        
-        with open(path, 'w', encoding='utf-8') as file:
+        with open(filepath, 'w', encoding='utf-8') as file:
             file.write(content)
         
-        print(f"✅ Text file saved: {path}")
-        return path
+        print(f"✅ Text file saved: {filepath}")
+        return True
     
     except Exception as e:
         print(f"❌ Error saving text file: {e}")
-        return None
+        return False
 
-def save_pdf(content, filename="StudyMaterial.pdf"):
+def save_pdf(content, filepath):
     """Save content as PDF file"""
     try:
-        from fpdf import FPDF
-        import textwrap
-
         pdf = FPDF()
         pdf.add_page()
         pdf.set_margins(left=20, top=20, right=20)
@@ -265,50 +224,24 @@ def save_pdf(content, filename="StudyMaterial.pdf"):
                     pdf.cell(0, 6, wrapped_line, ln=True)
 
         # Save PDF
-        os.makedirs(DOWNLOADS_FOLDER, exist_ok=True)
-        pdf_path = os.path.join(DOWNLOADS_FOLDER, filename)
-        pdf.output(pdf_path)
+        pdf.output(filepath)
         
-        print(f"✅ PDF file saved: {pdf_path}")
-        return pdf_path
+        print(f"✅ PDF file saved: {filepath}")
+        return True
 
-    except ImportError:
-        print("❌ FPDF library not found. Install with: pip install fpdf2")
-        return None
     except Exception as e:
         print(f"❌ PDF generation failed: {e}")
-        return None
+        return False
 
-# -------------- UTILITIES --------------
-
-def open_file(filepath):
-    """Open file with default system application"""
-    if not filepath or not os.path.exists(filepath):
-        return
-        
+def cleanup_session(session_id):
+    """Remove temporary files for a session"""
     try:
-        if platform.system() == "Darwin":  # macOS
-            subprocess.run(["open", filepath], check=True)
-        elif platform.system() == "Windows":
-            os.startfile(filepath)
-        elif platform.system() == "Linux":
-            subprocess.run(["xdg-open", filepath], check=True)
-        else:
-            print(f"Cannot auto-open file on this system: {filepath}")
+        session_temp_folder = os.path.join(TEMP_IMAGES_FOLDER, session_id)
+        if os.path.exists(session_temp_folder):
+            shutil.rmtree(session_temp_folder)
+            print(f"🧹 Cleaned up temporary files for session {session_id}")
     except Exception as e:
-        print(f"Cannot open file: {e}")
-
-def cleanup():
-    """Remove temporary files"""
-    try:
-        if os.path.exists(TEMP_IMAGES_FOLDER):
-            for file in os.listdir(TEMP_IMAGES_FOLDER):
-                file_path = os.path.join(TEMP_IMAGES_FOLDER, file)
-                os.remove(file_path)
-            os.rmdir(TEMP_IMAGES_FOLDER)
-            print("🧹 Temporary files cleaned up.")
-    except Exception as e:
-        print(f"Warning: Could not clean up temporary files: {e}")
+        print(f"Warning: Could not clean up temporary files for session {session_id}: {e}")
 
 def check_dependencies():
     """Check if required dependencies are available"""
@@ -331,6 +264,247 @@ def check_dependencies():
     except ImportError:
         missing_deps.append("google-generativeai")
     
+    return missing_deps
+
+def process_pdf_async(session_id, pdf_path, format_choice):
+    """Process PDF asynchronously"""
+    try:
+        processing_status[session_id] = {
+            "status": "processing", 
+            "step": "Starting PDF processing...",
+            "timestamp": time.time()
+        }
+        
+        # Step 1: Convert PDF to images
+        processing_status[session_id]["step"] = "Converting PDF to images..."
+        image_paths = convert_pdf_to_images(pdf_path, session_id)
+        if not image_paths:
+            processing_status[session_id] = {
+                "status": "error", 
+                "message": "Failed to convert PDF to images",
+                "timestamp": time.time()
+            }
+            return
+        
+        # Step 2: Extract text
+        processing_status[session_id]["step"] = "Extracting text from images..."
+        text = extract_text_from_images(image_paths)
+        if not text.strip():
+            processing_status[session_id] = {
+                "status": "error", 
+                "message": "No text extracted from PDF",
+                "timestamp": time.time()
+            }
+            return
+        
+        print(f"✅ Extracted text from {len(image_paths)} pages")
+        
+        # Step 3: Generate study material
+        processing_status[session_id]["step"] = "Generating study material with AI..."
+        study_material = generate_study_material(text, format_choice)
+        
+        if not study_material.strip():
+            processing_status[session_id] = {
+                "status": "error", 
+                "message": "Failed to generate study material",
+                "timestamp": time.time()
+            }
+            return
+        
+        # Step 4: Save files
+        processing_status[session_id]["step"] = "Saving your study material..."
+        
+        # Create session output directory
+        session_output_dir = os.path.join(OUTPUT_FOLDER, session_id)
+        os.makedirs(session_output_dir, exist_ok=True)
+        
+        # Save as text
+        text_path = os.path.join(session_output_dir, "StudyMaterial.txt")
+        save_text(study_material, text_path)
+        
+        # Save as PDF
+        pdf_path = os.path.join(session_output_dir, "StudyMaterial.pdf")
+        save_pdf(study_material, pdf_path)
+        
+        processing_status[session_id] = {
+            "status": "completed",
+            "text_file": text_path,
+            "pdf_file": pdf_path,
+            "timestamp": time.time()
+        }
+        
+        print("✅ All done! Study material is ready!")
+        
+        # Clean up temporary files
+        cleanup_session(session_id)
+        
+    except Exception as e:
+        processing_status[session_id] = {
+            "status": "error", 
+            "message": f"Processing failed: {str(e)}",
+            "timestamp": time.time()
+        }
+        print(f"❌ Processing error: {e}")
+
+# -------------- FLASK ROUTES --------------
+
+@app.route('/')
+def index():
+    """Main page"""
+    return render_template('index.html')
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    """Handle file upload and start processing"""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file selected'}), 400
+    
+    file = request.files['file']
+    format_choice = request.form.get('format', '1')
+    
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    
+    if file and allowed_file(file.filename):
+        # Generate unique session ID
+        session_id = str(uuid.uuid4())
+        session['session_id'] = session_id
+        
+        # Save uploaded file
+        filename = secure_filename(file.filename)
+        upload_path = os.path.join(UPLOAD_FOLDER, f"{session_id}_{filename}")
+        file.save(upload_path)
+        
+        print(f"📁 File uploaded: {filename} (Session: {session_id})")
+        
+        # Start processing in background
+        thread = threading.Thread(
+            target=process_pdf_async,
+            args=(session_id, upload_path, format_choice)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({'session_id': session_id}), 200
+    
+    return jsonify({'error': 'Invalid file type. Please upload a PDF.'}), 400
+
+@app.route('/status/<session_id>')
+def get_status(session_id):
+    """Get processing status for a session"""
+    status = processing_status.get(session_id, {"status": "not_found"})
+    return jsonify(status)
+
+@app.route('/download/<session_id>/<file_type>')
+def download_file(session_id, file_type):
+    """Download generated files"""
+    if session_id not in processing_status:
+        return "Session not found", 404
+    
+    status = processing_status[session_id]
+    if status.get("status") != "completed":
+        return "File not ready", 404
+    
+    if file_type == 'txt':
+        file_path = status.get('text_file')
+        mimetype = 'text/plain'
+        filename = 'StudyMaterial.txt'
+    elif file_type == 'pdf':
+        file_path = status.get('pdf_file')
+        mimetype = 'application/pdf'
+        filename = 'StudyMaterial.pdf'
+    else:
+        return "Invalid file type", 404
+    
+    if not file_path or not os.path.exists(file_path):
+        return "File not found", 404
+    
+    return send_file(file_path, as_attachment=True, download_name=filename, mimetype=mimetype)
+
+@app.route('/health')
+def health_check():
+    """Health check endpoint"""
+    missing_deps = check_dependencies()
+    
+    if missing_deps:
+        return jsonify({
+            'status': 'error',
+            'message': 'Missing dependencies',
+            'missing': missing_deps
+        }), 500
+    
+    if API_KEY == "YOUR_API_KEY_HERE" or not API_KEY:
+        return jsonify({
+            'status': 'error',
+            'message': 'API key not configured'
+        }), 500
+    
+    return jsonify({
+        'status': 'healthy',
+        'message': 'All dependencies available'
+    })
+
+@app.route('/cleanup')
+def cleanup_old_files():
+    """Clean up old files (call this periodically)"""
+    try:
+        current_time = time.time()
+        cleanup_count = 0
+        
+        # Clean up old uploads (older than 2 hours)
+        for filename in os.listdir(UPLOAD_FOLDER):
+            file_path = os.path.join(UPLOAD_FOLDER, filename)
+            if current_time - os.path.getctime(file_path) > 7200:  # 2 hours
+                os.remove(file_path)
+                cleanup_count += 1
+        
+        # Clean up old output directories (older than 2 hours)
+        for dirname in os.listdir(OUTPUT_FOLDER):
+            dir_path = os.path.join(OUTPUT_FOLDER, dirname)
+            if os.path.isdir(dir_path) and current_time - os.path.getctime(dir_path) > 7200:
+                shutil.rmtree(dir_path)
+                cleanup_count += 1
+        
+        # Clean up old processing status (older than 2 hours)
+        old_sessions = []
+        for session_id, status in processing_status.items():
+            if current_time - status.get('timestamp', current_time) > 7200:
+                old_sessions.append(session_id)
+        
+        for session_id in old_sessions:
+            del processing_status[session_id]
+            cleanup_count += 1
+        
+        return jsonify({
+            'status': 'success',
+            'cleaned_items': cleanup_count
+        })
+    
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 500
+
+# -------------- ERROR HANDLERS --------------
+
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Page not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
+
+# -------------- STARTUP CHECK --------------
+
+def startup_check():
+    """Check system requirements on startup"""
+    print("🎓 Smart Study Generator - Flask Server")
+    print("=" * 50)
+    
+    # Check dependencies
+    missing_deps = check_dependencies()
     if missing_deps:
         print("❌ Missing dependencies:")
         for dep in missing_deps:
@@ -340,102 +514,29 @@ def check_dependencies():
         print("  # Also install tesseract-ocr system package")
         return False
     
-    return True
-
-# -------------- MAIN FUNCTION --------------
-
-def main():
-    """Main program function"""
-    print("🎓 Smart Study Generator")
-    print("Transform your PDFs into personalized study materials!\n")
-    
-    # Check dependencies
-    if not check_dependencies():
-        print("Please install missing dependencies and try again.")
-        return
-    
     # Check API key
     if API_KEY == "YOUR_API_KEY_HERE" or not API_KEY:
         print("❌ Please set your Gemini API key!")
         print("Either:")
         print("1. Set environment variable: export GEMINI_API_KEY='your_key_here'")
-        print("2. Replace 'YOUR_API_KEY_HERE' in the script with your actual key")
-        return
+        print("2. Replace the API_KEY value in the script with your actual key")
+        return False
     
-    try:
-        # Step 1: Find PDF
-        pdf_path = find_pdf()
-        if not pdf_path:
-            return
-        
-        # Step 2: Get user format preference
-        format_choice = get_user_format_choice()
-        
-        print(f"\n🔄 Processing your PDF: {os.path.basename(pdf_path)}")
-        
-        # Step 3: Convert PDF to images
-        num_pages = convert_pdf_to_images(pdf_path)
-        if num_pages == 0:
-            print("❌ Failed to convert PDF to images!")
-            return
-        
-        # Step 4: Extract text
-        text = extract_text_from_images()
-        if not text.strip():
-            print("❌ No text extracted from PDF!")
-            return
-        
-        print(f"✅ Extracted text from {num_pages} pages")
-        
-        # Step 5: Generate study material
-        print(f"🤖 Creating your personalized study material...")
-        study_material = generate_study_material(text, format_choice)
-        
-        if not study_material.strip():
-            print("❌ Failed to generate study material!")
-            return
-        
-        # Step 6: Save files
-        print("💾 Saving your study material...")
-        text_path = save_text(study_material)
-        pdf_path = save_pdf(study_material)
-        
-        # Step 7: Open files
-        if text_path:
-            open_file(text_path)
-        if pdf_path:
-            open_file(pdf_path)
-        
-        print("\n✅ All done! Your personalized study material is ready!")
-        
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Process interrupted by user")
-    except Exception as e:
-        print(f"\n❌ Unexpected error: {e}")
-    finally:
-        cleanup()
+    print("✅ All dependencies available")
+    print("✅ API key configured")
+    print("🚀 Server starting...")
+    return True
 
-# -------------- RUN PROGRAM --------------
-if __name__ == "__main__":
-    main()
+# -------------- MAIN --------------
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+if __name__ == '__main__':
+    if startup_check():
+        # Run the Flask app
+        app.run(
+            debug=True, 
+            host='0.0.0.0', 
+            port=8000,
+            threaded=True
+        )
+    else:
+        print("❌ Startup check failed. Please fix the issues above.")
